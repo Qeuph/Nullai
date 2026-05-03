@@ -7,8 +7,21 @@ import torch
 
 from null_ai import NullAI, NullAIConfig, CharTokenizer, load_quantised
 
-# Backward-compatibility for checkpoints that pickle NullAIConfig under __main__.
-setattr(sys.modules["__main__"], "NullAIConfig", NullAIConfig)
+
+def _register_legacy_pickle_symbols() -> None:
+    """Register legacy __main__ symbols used by older checkpoints.
+
+    Some checkpoints were saved while training scripts were executed directly,
+    which pickles classes under ``__main__``. Expose those names here so
+    ``torch.load(..., weights_only=False)`` can resolve them.
+    """
+    main_mod = sys.modules["__main__"]
+    setattr(main_mod, "NullAIConfig", NullAIConfig)
+    setattr(main_mod, "NullAI", NullAI)
+    setattr(main_mod, "CharTokenizer", CharTokenizer)
+
+
+_register_legacy_pickle_symbols()
 
 def load_model(checkpoint: str, quantized: bool, device: torch.device):
     if quantized:
