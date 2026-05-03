@@ -9,25 +9,29 @@ from null_ai import NullAI, NullAIConfig, CharTokenizer, load_quantised
 
 
 def _register_legacy_pickle_symbols() -> None:
-    """Register legacy __main__ symbols used by older checkpoints.
-
-    Some checkpoints were saved while training scripts were executed directly,
-    which pickles classes under ``__main__``. Expose those names here so
-    ``torch.load(..., weights_only=False)`` can resolve them.
-    """
+    """Register legacy __main__ symbols used by older checkpoints."""
     main_mod = sys.modules["__main__"]
     setattr(main_mod, "NullAIConfig", NullAIConfig)
     setattr(main_mod, "NullAI", NullAI)
     setattr(main_mod, "CharTokenizer", CharTokenizer)
 
 
-_register_legacy_pickle_symbols()
+def _torch_load_compat(path: str, device: torch.device):
+    """Compatibility loader for PyTorch >=2.6 weights_only changes."""
+    try:
+        return torch.load(path, map_location=device, weights_only=False)
+    except TypeError:
+        # Older torch may not support weights_only argument.
+        return torch.load(path, map_location=device)
+
 
 def load_model(checkpoint: str, quantized: bool, device: torch.device):
+    _register_legacy_pickle_symbols()
     if quantized:
+        # Keep this path routed through null_ai.load_quantised so dequant logic stays centralized.
         model, cfg = load_quantised(checkpoint, device)
     else:
-        ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
+        ckpt = _torch_load_compat(checkpoint, device)
         cfg = ckpt["cfg"]
         model = NullAI(cfg).to(device)
         model.load_state_dict(ckpt["model"])

@@ -13,6 +13,7 @@ The latest recorded run (provided in project notes) used:
 
 ### Model snapshot
 
+- **Architecture:** 8 layers, `d_model=256`, GQA (`4Q / 2KV`), `d_mlp=1024`
 - **Parameters:** 7,481,267
 - **Model size (bf16):** 14.3 MB
 - **Quantized checkpoint:** 7.3 MB (`null_ai_final_int8.pt`)
@@ -76,6 +77,12 @@ python chat_loop.py --checkpoint null_ai_final_int8.pt --quantized
 - `/reset` — clear conversation memory
 - `/raw` — print raw generated text (including prompt prefix)
 - `/quit` — exit
+
+## PyTorch 2.6+ compatibility note
+
+PyTorch 2.6 changed `torch.load` default behavior to `weights_only=True`, which can break loading checkpoints that contain pickled config/classes. `chat_loop.py` now loads full checkpoints in compatibility mode (`weights_only=False`, with fallback for older PyTorch) and registers legacy `__main__` symbols so older Null AI checkpoints still load.
+
+If you trust your checkpoint source and still see loading errors, ensure you are launching with the updated `chat_loop.py` from this repository.
 
 ## Notes
 
