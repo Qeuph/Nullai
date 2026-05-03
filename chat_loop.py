@@ -2,10 +2,13 @@
 """Interactive inference loop for Null AI checkpoints."""
 
 import argparse
+import sys
 import torch
 
-from null_ai import NullAI, CharTokenizer, load_quantised
+from null_ai import NullAI, NullAIConfig, CharTokenizer, load_quantised
 
+# Backward-compatibility for checkpoints that pickle NullAIConfig under __main__.
+setattr(sys.modules["__main__"], "NullAIConfig", NullAIConfig)
 
 def load_model(checkpoint: str, quantized: bool, device: torch.device):
     if quantized:
