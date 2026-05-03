@@ -61,7 +61,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import autocast, GradScaler
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # SECTION 1 — CONFIGURATION
@@ -1056,24 +1055,23 @@ def test_time_train(
     opt = torch.optim.Adam(ttt_params, lr=cfg.ttt_lr, betas=(0.9, 0.99))
 
     model.train()
-    for _ in range(cfg.ttt_steps):
-        with autocast(dtype=torch.bfloat16):
-            _, loss = model(x, y)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        opt.step()
-        opt.zero_grad()
+    with torch.enable_grad():
+        for _ in range(cfg.ttt_steps):
+            with torch.amp.autocast(device_type=x.device.type, dtype=torch.bfloat16):
+                _, loss = model(x, y)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            opt.zero_grad()
 
     model.eval()
-    with torch.no_grad(), autocast(dtype=torch.bfloat16):
+    with torch.no_grad(), torch.amp.autocast(device_type=x.device.type, dtype=torch.bfloat16):
         _, val_loss = model(x, y)
     ttt_loss = val_loss.item()
 
     # Restore original weights
     model.load_state_dict(orig_state)
     return ttt_loss
-
-
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # SECTION 18 — INT8 QUANTISED SAVE
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1239,7 +1237,7 @@ class NullAITrainer:
             weight_decay=0.0,
         )
 
-        self.scaler = GradScaler()
+        self.scaler = torch.amp.GradScaler(device=self.device.type)
         self.ema    = EMA(model, decay=cfg.ema_decay)
 
     def _set_lr(self, lr: float):
@@ -1268,7 +1266,7 @@ class NullAITrainer:
         self.muon.zero_grad()
         self.adam.zero_grad()
 
-        with autocast(dtype=torch.bfloat16):
+        with torch.amp.autocast(device_type=self.device.type, dtype=torch.bfloat16):
             _, loss = self.model(x, y)
 
         self.scaler.scale(loss).backward()
@@ -1296,7 +1294,7 @@ class NullAITrainer:
         total = 0.0
         for _ in range(n_batches):
             x, y = val_ds.get_batch(self.cfg.batch_size)
-            with autocast(dtype=torch.bfloat16):
+            with torch.amp.autocast(device_type=self.device.type, dtype=torch.bfloat16):
                 _, loss = self.model(x, y)
             total += loss.item()
         val_bpb = bits_per_byte(total / n_batches)
@@ -1618,7 +1616,7 @@ if __name__ == '__main__':
         _, val_ds, _ = load_data(cfg2, args.data, device, args.dataset)
         for _ in range(n):
             x, y = val_ds.get_batch(8)
-            with torch.no_grad(), autocast(dtype=torch.bfloat16):
+            with torch.no_grad(), torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16):
                 _, loss = model(x, y)
             total += loss.item()
         print(f"Val BPB: {bits_per_byte(total/n):.4f}")
