@@ -1108,7 +1108,7 @@ def save_quantised(model: nn.Module, path: str, cfg: NullAIConfig):
 
 def load_quantised(path: str, device: torch.device) -> Tuple['NullAI', NullAIConfig]:
     """Load and dequantise an int8 checkpoint."""
-    ckpt = torch.load(path, map_location=device)
+    ckpt = torch.load(path, map_location=device, weights_only=False)
     cfg  = ckpt['cfg']
     model = NullAI(cfg).to(device)
 
@@ -1331,7 +1331,7 @@ class NullAITrainer:
             self.ema.restore(self.model)
 
     def load(self, path: str):
-        ckpt = torch.load(path, map_location=self.device)
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
         self.model.load_state_dict(ckpt['model'])
         self.step         = ckpt.get('step', 0)
         self.best_val_bpb = ckpt.get('best_val', float('inf'))
