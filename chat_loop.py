@@ -11,7 +11,7 @@ def load_model(checkpoint: str, quantized: bool, device: torch.device):
     if quantized:
         model, cfg = load_quantised(checkpoint, device)
     else:
-        ckpt = torch.load(checkpoint, map_location=device)
+        ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
         cfg = ckpt["cfg"]
         model = NullAI(cfg).to(device)
         model.load_state_dict(ckpt["model"])
