@@ -29,7 +29,19 @@ def load_model(checkpoint: str, quantized: bool, device: torch.device):
     _register_legacy_pickle_symbols()
     if quantized:
         # Keep this path routed through null_ai.load_quantised so dequant logic stays centralized.
-        model, cfg = load_quantised(checkpoint, device)
+        # PyTorch >=2.6 defaults torch.load(weights_only=True); older quantized checkpoints may
+        # pickle config classes, so force weights_only=False for this call path.
+        original_torch_load = torch.load
+
+        def _torch_load_quant_compat(path, *args, **kwargs):
+            kwargs.setdefault("weights_only", False)
+            return original_torch_load(path, *args, **kwargs)
+
+        torch.load = _torch_load_quant_compat
+        try:
+            model, cfg = load_quantised(checkpoint, device)
+        finally:
+            torch.load = original_torch_load
     else:
         ckpt = _torch_load_compat(checkpoint, device)
         cfg = ckpt["cfg"]
