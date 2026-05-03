@@ -460,8 +460,8 @@ class GQAttention(nn.Module):
         self.rope       = rope
 
         self.q_proj     = nn.Linear(cfg.d_model, cfg.n_heads * self.d_head, bias=False)
-        self.k_proj     = nn.Linear(cfg.d_model, cfg.n_kv    * self.d_head, bias=False)
-        self.v_proj     = nn.Linear(cfg.d_model, cfg.n_kv    * self.d_head, bias=False)
+        self.k_proj     = nn.Linear(cfg.d_model, self.n_kv   * self.d_head, bias=False)
+        self.v_proj     = nn.Linear(cfg.d_model, self.n_kv   * self.d_head, bias=False)
         self.o_proj     = nn.Linear(cfg.n_heads * self.d_head, cfg.d_model, bias=False)
 
         # Per-head QK gain: learned scalar per query head, init = 5.0
