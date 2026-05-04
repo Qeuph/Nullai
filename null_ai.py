@@ -801,7 +801,9 @@ class NullAI(nn.Module):
             loss = F.cross_entropy(
                 logits.reshape(-1, self.cfg.vocab_size),
                 targets.reshape(-1),
-                ignore_index=self.cfg.pad_id,
+                # Assistant-only batching masks non-target tokens to -100.
+                # Must ignore -100 here (not pad_id) to avoid CUDA nll assertions.
+                ignore_index=-100,
             )
 
         return logits, loss, next_kv
