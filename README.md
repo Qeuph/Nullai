@@ -29,8 +29,8 @@ Null AI currently uses `ChatTokenizer` (word/subword-like regex tokenizer), not 
 
 ## Model snapshot (project defaults)
 
-- **Architecture:** 8 layers, `d_model=256`, GQA (`4Q / 2KV`), `d_mlp=1024`
-- **Context length:** `max_seq_len=512` (train sequence chunks default `seq_len=256`)
+- **Architecture:** 8 layers, `d_model=264`, GQA (`4Q / 2KV`), `d_mlp=1056`
+- **Context length:** `max_seq_len=2048` (train sequence chunks default `seq_len=256`)
 - **Core features:**
   - Partial RoPE
   - SmearGate
@@ -75,16 +75,14 @@ Quantized checkpoint:
 python chat_loop.py --checkpoint null_ai_final_int8.pt --quantized
 ```
 
-### Improved decoding controls
-
-`chat_loop.py` now supports stronger anti-loop/repetition controls:
+### Decoding controls
 
 - `--repetition_penalty` (default `1.1`)
 - `--no_repeat_ngram_size` (default `3`)
 - `--min_new_tokens` (default `24`)
 - Existing: `--temperature`, `--top_k`, `--top_p`, `--max_new_tokens`
 
-The chat loop also trims long history to fit model context (`cfg.max_seq_len`) before generation.
+The chat loop trims long history to fit model context (`cfg.max_seq_len`) before generation.
 
 ### In-chat commands
 
@@ -96,6 +94,20 @@ The chat loop also trims long history to fit model context (`cfg.max_seq_len`) b
 
 PyTorch 2.6+ changed `torch.load` default behavior (`weights_only=True`).
 `chat_loop.py` includes compatibility loading for legacy checkpoints that store pickled config/classes.
+
+## Validation checks
+
+To quickly verify code health after updates:
+
+```bash
+python -m py_compile null_ai.py chat_loop.py
+```
+
+```bash
+python chat_loop.py --help
+```
+
+> Note: running full training to completion is compute-intensive and not part of the lightweight sanity checks above.
 
 ## Files
 

@@ -66,7 +66,7 @@ def main():
     args = p.parse_args()
 
     device = torch.device(args.device)
-    model, _ = load_model(args.checkpoint, args.quantized, device)
+    model, cfg = load_model(args.checkpoint, args.quantized, device)
     tokenizer = ChatTokenizer.load("tokenizer_vocab.json")
 
     history = ""
