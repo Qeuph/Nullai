@@ -59,6 +59,9 @@ def main():
     p.add_argument("--top_k", type=int, default=50)
     p.add_argument("--top_p", type=float, default=0.95)
     p.add_argument("--max_new_tokens", type=int, default=180)
+    p.add_argument("--repetition_penalty", type=float, default=1.1)
+    p.add_argument("--no_repeat_ngram_size", type=int, default=3)
+    p.add_argument("--min_new_tokens", type=int, default=24)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = p.parse_args()
 
@@ -90,7 +93,10 @@ def main():
             user = input("Prompt: ").rstrip("\n")
 
         history += f"<|user|> {user}\n<|assistant|>"
-        ids = torch.tensor(tokenizer.encode(history, add_bos=True), dtype=torch.long, device=device).unsqueeze(0)
+        encoded = tokenizer.encode(history, add_bos=True)
+        if len(encoded) > max(32, cfg.max_seq_len - 8):
+            encoded = [tokenizer.BOS] + encoded[-(cfg.max_seq_len - 1):]
+        ids = torch.tensor(encoded, dtype=torch.long, device=device).unsqueeze(0)
 
         with torch.no_grad():
             out = model.generate(
@@ -99,6 +105,9 @@ def main():
                 temperature=args.temperature,
                 top_k=args.top_k,
                 top_p=args.top_p,
+                repetition_penalty=args.repetition_penalty,
+                no_repeat_ngram_size=args.no_repeat_ngram_size,
+                min_new_tokens=args.min_new_tokens,
             )
 
         text = tokenizer.decode(out[0].tolist())

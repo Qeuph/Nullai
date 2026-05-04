@@ -781,17 +781,41 @@ class NullAI(nn.Module):
         temperature: float = 0.8,
         top_k: int = 50,
         top_p: float = 0.95,
+        repetition_penalty: float = 1.1,
+        no_repeat_ngram_size: int = 3,
+        min_new_tokens: int = 0,
     ) -> torch.Tensor:
         self.eval()
-        device = prompt_ids.device
+        _ = prompt_ids.device
 
-        for _ in range(max_new_tokens):
+        for step in range(max_new_tokens):
             ctx    = prompt_ids[:, -self.cfg.max_seq_len:]
-            if _ == 0:
+            if step == 0:
                 logits, _, kv_cache = self.forward(ctx, use_cache=True)
             else:
                 logits, _, kv_cache = self.forward(prompt_ids[:, -1:], past_kv=kv_cache, use_cache=True)
             logits = logits[:, -1, :] / max(temperature, 1e-6)
+
+            # Repetition penalty: down-rank already generated tokens.
+            if repetition_penalty and repetition_penalty > 1.0:
+                seen_ids = set(prompt_ids[0].tolist())
+                for tok_id in seen_ids:
+                    if logits[0, tok_id] < 0:
+                        logits[0, tok_id] *= repetition_penalty
+                    else:
+                        logits[0, tok_id] /= repetition_penalty
+
+            # No-repeat n-gram blocking (single-batch generation path).
+            if no_repeat_ngram_size and no_repeat_ngram_size > 1 and prompt_ids.size(1) >= no_repeat_ngram_size - 1:
+                generated = prompt_ids[0].tolist()
+                prefix = tuple(generated[-(no_repeat_ngram_size - 1):])
+                banned = set()
+                for i in range(len(generated) - no_repeat_ngram_size + 1):
+                    ng = generated[i:i + no_repeat_ngram_size]
+                    if tuple(ng[:-1]) == prefix:
+                        banned.add(ng[-1])
+                if banned:
+                    logits[0, list(banned)] = float('-inf')
 
             # Top-k filtering
             if top_k > 0:
@@ -810,7 +834,7 @@ class NullAI(nn.Module):
             next_tok = torch.multinomial(probs, num_samples=1)
             prompt_ids = torch.cat([prompt_ids, next_tok], dim=1)
 
-            if next_tok.item() == self.cfg.eos_id:
+            if step + 1 >= min_new_tokens and next_tok.item() == self.cfg.eos_id:
                 break
 
         return prompt_ids
