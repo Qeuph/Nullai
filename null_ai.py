@@ -1484,7 +1484,8 @@ class NullAITrainer:
         if self.cfg.ttt_enabled:
             x, y = val_ds.get_batch(self.cfg.batch_size)
             self.ema.restore(self.model)           # restore before TTT mutates
-            ttt_loss = test_time_train(self.model, (x, y), self.cfg)
+            with torch.enable_grad():
+                ttt_loss = test_time_train(self.model, (x, y), self.cfg)
             ttt_bpb  = bits_per_byte(ttt_loss)
             self.ema.apply(self.model)             # re-apply EMA for consistency
 
