@@ -35,7 +35,7 @@ Techniques Implemented:
   ✓ Test-Time Training (TTT) eval pass                 → PR #1736
   ✓ Post-training int8 quantization + compress save    → PR #1797 inspired
 
-Target: ~8M params → ~16 MB (bfloat16) on T4 Colab free tier
+Target: ~16M params → ~32 MB (bfloat16) on T4 Colab free tier
 
 Usage:
     # Colab: just run — downloads TinyShakespeare automatically
@@ -64,7 +64,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import autocast, GradScaler
+from torch import amp
 from tqdm import tqdm
 from tokenizers import Tokenizer, models, trainers, pre_tokenizers, processors, decoders
 from datasets import load_dataset
@@ -248,7 +248,8 @@ class HypercubeSpikeEncoder(nn.Module):
         self.d_model       = d_model
         self.hypercube_dim = hypercube_dim
         self.n_reservoir   = 2 ** hypercube_dim          # 32 for dim=5
-        self.n_groups      = d_model // self.n_reservoir # groups of 32
+        self.n_groups      = math.ceil(d_model / self.n_reservoir)  # groups of 32 (ceil for non-multiples)
+        self.d_padded      = self.n_groups * self.n_reservoir
         self.sparsity      = sparsity
 
         # Adjacency mask for spike propagation (fixed, not trained)
@@ -302,8 +303,16 @@ class HypercubeSpikeEncoder(nn.Module):
         threshold = self.threshold_proj(x)               # (B, T, D)
 
         # Reshape to groups of n_reservoir neurons
-        x_g = x.reshape(B * T, self.n_groups, self.n_reservoir)    # (BT, G, 32)
-        th_g = threshold.reshape(B * T, self.n_groups, self.n_reservoir)
+        if D < self.d_padded:
+            pad = self.d_padded - D
+            x_pad = F.pad(x, (0, pad))
+            th_pad = F.pad(threshold, (0, pad))
+        else:
+            x_pad = x
+            th_pad = threshold
+
+        x_g = x_pad.reshape(B * T, self.n_groups, self.n_reservoir)    # (BT, G, 32)
+        th_g = th_pad.reshape(B * T, self.n_groups, self.n_reservoir)
 
         # Fire: compute spike patterns
         spikes = self._fire(x_g, th_g)                  # (BT, G, 32)
@@ -316,7 +325,7 @@ class HypercubeSpikeEncoder(nn.Module):
         )                                                # (BT, G, 32)
 
         # Reshape back to (B, T, D)
-        spike_out = propagated.reshape(B, T, D)
+        spike_out = propagated.reshape(B, T, self.d_padded)[..., :D]
 
         # Gate and blend: residual connection with learned scale
         gate       = torch.sigmoid(self.out_gate(spike_out))
@@ -1154,7 +1163,7 @@ def test_time_train(
 
     model.train()
     for _ in range(cfg.ttt_steps):
-        with autocast(dtype=torch.bfloat16):
+        with amp.autocast("cuda", dtype=torch.bfloat16, enabled=(self.device.type == "cuda")):
             _, loss, _ = model(x, y)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -1403,7 +1412,7 @@ class NullAITrainer:
             weight_decay=0.0,
         )
 
-        self.scaler = GradScaler()
+        self.scaler = amp.GradScaler("cuda", enabled=(self.device.type == "cuda"))
         self.ema    = EMA(model, decay=cfg.ema_decay)
 
     def _set_lr(self, lr: float):
@@ -1432,7 +1441,7 @@ class NullAITrainer:
         self.muon.zero_grad()
         self.adam.zero_grad()
 
-        with autocast(dtype=torch.bfloat16):
+        with amp.autocast("cuda", dtype=torch.bfloat16, enabled=(self.device.type == "cuda")):
             _, loss, _ = self.model(x, y)
 
         self.scaler.scale(loss).backward()
@@ -1460,7 +1469,7 @@ class NullAITrainer:
         total = 0.0
         for _ in range(n_batches):
             x, y = val_ds.get_batch(self.cfg.batch_size)
-            with autocast(dtype=torch.bfloat16):
+            with amp.autocast("cuda", dtype=torch.bfloat16, enabled=(self.device.type == "cuda")):
                 _, loss, _ = self.model(x, y)
             total += loss.item()
         val_bpb = bits_per_byte(total / n_batches)
@@ -1565,8 +1574,9 @@ def train(cfg: NullAIConfig, data_path: Optional[str] = None,
   │  Size (bf16)    : {sz_mb:>8.1f} MB               │
   └─────────────────────────────────────────────┘""")
 
-    if sz_mb > 20:
-        print(f"  ⚠  Model is {sz_mb:.1f} MB — over 16 MB target. "
+    target_mb = 32.0
+    if sz_mb > target_mb:
+        print(f"  ⚠  Model is {sz_mb:.1f} MB — over {target_mb:.0f} MB target. "
               f"Reduce d_model or n_layers.")
 
     # ── Trainer ─────────────────────────────────────────────────────────────
