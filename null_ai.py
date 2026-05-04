@@ -1614,7 +1614,10 @@ def train(cfg: NullAIConfig, data_path: Optional[str] = None,
     log_count    = 0
     best_path    = 'null_ai_best.pt'
     seq_schedule = sorted([(float(p), int(s)) for p, s in cfg.seq_len_schedule], key=lambda x: x[0])
-    current_seq_len = cfg.seq_len
+    seq_cap = min(cfg.seq_len, cfg.max_seq_len)
+    if any(s > seq_cap for _, s in seq_schedule):
+        print(f"  Note: capping seq-len curriculum at {seq_cap} (from --seq_len/--max_seq_len)")
+    current_seq_len = seq_cap
 
     def apply_seq_len_for_step(step_idx: int):
         nonlocal current_seq_len
@@ -1622,7 +1625,7 @@ def train(cfg: NullAIConfig, data_path: Optional[str] = None,
         target_seq = current_seq_len
         for frac, slen in seq_schedule:
             if progress >= frac:
-                target_seq = min(slen, cfg.max_seq_len)
+                target_seq = min(slen, seq_cap)
         if target_seq != current_seq_len:
             current_seq_len = target_seq
             train_ds.set_seq_len(current_seq_len)
