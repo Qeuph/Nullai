@@ -5,7 +5,7 @@ import argparse
 import sys
 import torch
 
-from null_ai import NullAI, NullAIConfig, CharTokenizer, load_quantised
+from null_ai import NullAI, NullAIConfig, ChatTokenizer, CharTokenizer, load_quantised
 
 
 def _register_legacy_pickle_symbols() -> None:
@@ -64,7 +64,7 @@ def main():
 
     device = torch.device(args.device)
     model, _ = load_model(args.checkpoint, args.quantized, device)
-    tokenizer = CharTokenizer()
+    tokenizer = ChatTokenizer.load("tokenizer_vocab.json")
 
     history = ""
 
@@ -89,7 +89,7 @@ def main():
             raw_mode = True
             user = input("Prompt: ").rstrip("\n")
 
-        history += f"User: {user}\nAssistant:"
+        history += f"<|user|> {user}\n<|assistant|>"
         ids = torch.tensor(tokenizer.encode(history, add_bos=True), dtype=torch.long, device=device).unsqueeze(0)
 
         with torch.no_grad():
@@ -110,8 +110,8 @@ def main():
         completion = text[len(history):]
         stop_positions = [
             pos for pos in (
-                completion.find("\nUser:"),
-                completion.find("\nAssistant:"),
+                completion.find("\n<|user|>"),
+                completion.find("\n<|assistant|>"),
             ) if pos != -1
         ]
         if stop_positions:
