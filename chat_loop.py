@@ -3,6 +3,7 @@
 
 import argparse
 import sys
+from collections import Counter
 import torch
 
 from null_ai import NullAI, NullAIConfig, ChatTokenizer, CharTokenizer, load_quantised
@@ -60,6 +61,9 @@ def main():
     p.add_argument("--top_p", type=float, default=0.95)
     p.add_argument("--max_new_tokens", type=int, default=180)
     p.add_argument("--repetition_penalty", type=float, default=1.1)
+    p.add_argument("--presence_penalty", type=float, default=0.05)
+    p.add_argument("--frequency_penalty", type=float, default=0.05)
+    p.add_argument("--repeat_window", type=int, default=192)
     p.add_argument("--no_repeat_ngram_size", type=int, default=3)
     p.add_argument("--min_new_tokens", type=int, default=24)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -69,7 +73,7 @@ def main():
     model, cfg = load_model(args.checkpoint, args.quantized, device)
     tokenizer = ChatTokenizer.load("tokenizer_vocab.json")
 
-    history = ""
+    history_turns = []
 
     print("Null AI chat loop ready. Type /quit to exit, /reset to clear history, /raw for raw output.")
     print(f"Using device: {device}")
@@ -83,7 +87,7 @@ def main():
             print("Bye.")
             break
         if user == "/reset":
-            history = ""
+            history_turns = []
             print("History cleared.")
             continue
 
@@ -92,10 +96,30 @@ def main():
             raw_mode = True
             user = input("Prompt: ").rstrip("\n")
 
-        history += f"<|user|> {user}\n<|assistant|>"
-        encoded = tokenizer.encode(history, add_bos=True)
-        if len(encoded) > max(32, cfg.max_seq_len - 8):
-            encoded = [tokenizer.BOS] + encoded[-(cfg.max_seq_len - 1):]
+        def _prompt_from_turns(turns, include_assistant_prefix=True):
+            rendered = "".join(f"<|{r}|> {t}\n" for r, t in turns)
+            if include_assistant_prefix:
+                rendered += "<|assistant|>"
+            return rendered
+
+        def _encode_with_budget(turns, max_ctx, reserve_tokens=8):
+            budget = max(32, max_ctx - reserve_tokens)
+            trimmed = list(turns)
+            while trimmed:
+                prompt = _prompt_from_turns(trimmed, include_assistant_prefix=True)
+                enc = tokenizer.encode(prompt, add_bos=True)
+                if len(enc) <= budget:
+                    return enc, trimmed
+                trimmed = trimmed[1:]
+            return tokenizer.encode("<|assistant|>", add_bos=True), []
+
+        if not raw_mode:
+            history_turns.append(("user", user))
+            encoded, history_turns = _encode_with_budget(history_turns, cfg.max_seq_len, reserve_tokens=args.max_new_tokens + 8)
+        else:
+            encoded = tokenizer.encode(user, add_bos=True)
+            if len(encoded) > cfg.max_seq_len - 1:
+                encoded = [tokenizer.BOS] + encoded[-(cfg.max_seq_len - 1):]
         ids = torch.tensor(encoded, dtype=torch.long, device=device).unsqueeze(0)
 
         print("Assistant: ", end="", flush=True)
@@ -110,6 +134,9 @@ def main():
             top_k = args.top_k
             top_p = args.top_p
             repetition_penalty = args.repetition_penalty
+            presence_penalty = args.presence_penalty
+            frequency_penalty = args.frequency_penalty
+            repeat_window = max(1, args.repeat_window)
             no_repeat_ngram_size = args.no_repeat_ngram_size
             min_new_tokens = args.min_new_tokens
 
@@ -125,14 +152,17 @@ def main():
 
                 logits = logits[:, -1, :] / max(temperature, 1e-6)
 
-                # Repetition penalty
+                # Repetition/frequency/presence penalties (recency windowed)
                 if repetition_penalty and repetition_penalty > 1.0:
-                    seen_ids = set(prompt_ids[0].tolist())
-                    for tok_id in seen_ids:
+                    special_exempt = {tokenizer.PAD, tokenizer.BOS, tokenizer.EOS, tokenizer.USER, tokenizer.ASSISTANT}
+                    recent = prompt_ids[0, -repeat_window:].tolist()
+                    counts = Counter(t for t in recent if t not in special_exempt)
+                    for tok_id, count in counts.items():
                         if logits[0, tok_id] < 0:
                             logits[0, tok_id] *= repetition_penalty
                         else:
                             logits[0, tok_id] /= repetition_penalty
+                        logits[0, tok_id] -= (presence_penalty + frequency_penalty * float(count))
 
                 # No-repeat n-gram blocking
                 if no_repeat_ngram_size and no_repeat_ngram_size > 1 and prompt_ids.size(1) >= no_repeat_ngram_size - 1:
@@ -194,7 +224,7 @@ def main():
         completion = completion.strip() or "..."
         print(f"Assistant: {completion}")
 
-        history += f" {completion}\n"
+        history_turns.append(("assistant", completion))
 
 
 if __name__ == "__main__":
