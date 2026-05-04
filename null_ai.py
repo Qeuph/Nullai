@@ -1165,7 +1165,8 @@ def test_time_train(
 
     model.train()
     for _ in range(cfg.ttt_steps):
-        with amp.autocast("cuda", dtype=torch.bfloat16, enabled=(self.device.type == "cuda")):
+        use_cuda = (x.device.type == "cuda")
+        with amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_cuda):
             _, loss, _ = model(x, y)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -1443,7 +1444,8 @@ class NullAITrainer:
         self.muon.zero_grad()
         self.adam.zero_grad()
 
-        with amp.autocast("cuda", dtype=torch.bfloat16, enabled=(self.device.type == "cuda")):
+        use_cuda = (self.device.type == "cuda")
+        with amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_cuda):
             _, loss, _ = self.model(x, y)
 
         self.scaler.scale(loss).backward()
@@ -1471,7 +1473,8 @@ class NullAITrainer:
         total = 0.0
         for _ in range(n_batches):
             x, y = val_ds.get_batch(self.cfg.batch_size)
-            with amp.autocast("cuda", dtype=torch.bfloat16, enabled=(self.device.type == "cuda")):
+            use_cuda = (self.device.type == "cuda")
+            with amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_cuda):
                 _, loss, _ = self.model(x, y)
             total += loss.item()
         val_bpb = bits_per_byte(total / n_batches)
