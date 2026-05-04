@@ -55,6 +55,7 @@ Usage:
 import os, sys, math, time, json, copy, struct, argparse, hashlib
 import urllib.request
 import re
+import random
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, List, Dict
@@ -64,6 +65,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.cuda.amp import autocast, GradScaler
+from tqdm import tqdm
+from tokenizers import Tokenizer, models, trainers, pre_tokenizers, processors, decoders
+from datasets import load_dataset
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # SECTION 1 — CONFIGURATION
@@ -73,17 +77,18 @@ from torch.cuda.amp import autocast, GradScaler
 class NullAIConfig:
     """
     NullAI model + training configuration.
-    Defaults are tuned to hit ~16MB (bfloat16) and train well on T4 Colab.
+    Defaults are tuned to hit ~32MB (bfloat16) and train well on T4 Colab.
     """
 
     # ── Model size ──────────────────────────────────────────────────────────
     vocab_size: int  = 32000     # Updated at runtime by tokenizer
-    max_seq_len: int = 512
-    d_model: int     = 256       # Hidden dimension
+    max_seq_len: int = 2048      # Increased context length
+    d_model: int     = 264       # Scaled hidden dimension
     n_layers: int    = 8         # Number of transformer blocks
     n_heads: int     = 4         # Query heads
     n_kv_heads: int  = 2         # KV heads (GQA ratio 2:1)
-    d_mlp: int       = 1024      # MLP inner dim (4× d_model)
+    d_mlp: int       = 1056      # Scaled MLP inner dim (4× d_model)
+    window_size: int = 512       # Sliding window attention size
 
     # ── Architectural features ───────────────────────────────────────────────
     rope_frac: float          = 0.25   # Partial RoPE: fraction of head dims
@@ -463,8 +468,8 @@ class GQAttention(nn.Module):
         self.rope       = rope
 
         self.q_proj     = nn.Linear(cfg.d_model, cfg.n_heads * self.d_head, bias=False)
-        self.k_proj     = nn.Linear(cfg.d_model, cfg.n_kv    * self.d_head, bias=False)
-        self.v_proj     = nn.Linear(cfg.d_model, cfg.n_kv    * self.d_head, bias=False)
+        self.k_proj     = nn.Linear(cfg.d_model, cfg.n_kv_heads * self.d_head, bias=False)
+        self.v_proj     = nn.Linear(cfg.d_model, cfg.n_kv_heads * self.d_head, bias=False)
         self.o_proj     = nn.Linear(cfg.n_heads * self.d_head, cfg.d_model, bias=False)
 
         # Per-head QK gain: learned scalar per query head, init = 5.0
@@ -491,31 +496,38 @@ class GQAttention(nn.Module):
         q = self.rope(q)
         k = self.rope(k)
 
-        # Per-head scale: qk_gain / sqrt(d_head)
-        scale = self.qk_gain.reshape(1, self.n_heads, 1, 1) / math.sqrt(self.d_head)
-
-        # Expand KV for GQA
-        k = k.repeat_interleave(self.n_rep, dim=1)   # (B, H, T, d_head)
-        v = v.repeat_interleave(self.n_rep, dim=1)
         if past_kv is not None:
             pk, pv = past_kv
             k = torch.cat([pk, k], dim=2)
             v = torch.cat([pv, v], dim=2)
 
+        new_kv = (k, v) if use_cache else None
+
+        # Per-head scale: qk_gain / sqrt(d_head)
+        scale = self.qk_gain.reshape(1, self.n_heads, 1, 1) / math.sqrt(self.d_head)
+
+        # Expand KV for GQA
+        k_rep = k.repeat_interleave(self.n_rep, dim=1)   # (B, H, T_total, d_head)
+        v_rep = v.repeat_interleave(self.n_rep, dim=1)
+
         # Attention scores + causal mask
-        scores = torch.matmul(q * scale, k.transpose(-2, -1))
+        scores = torch.matmul(q * scale, k_rep.transpose(-2, -1))
         if causal_mask is not None:
-            scores = scores + causal_mask
+            # When using KV cache, T_q = 1, T_k = T_total. Mask should be (1, T_total)
+            if T == 1 and k.shape[2] > 1:
+                # We need a mask for just the new token against all previous
+                scores = scores + causal_mask[:, :, -1:, :k.shape[2]]
+            else:
+                scores = scores + causal_mask[:, :, :T, :T]
         attn   = F.softmax(scores, dim=-1)
 
-        out = torch.matmul(attn, v)                   # (B, H, T, d_head)
+        out = torch.matmul(attn, v_rep)                   # (B, H, T, d_head)
         out = out.transpose(1, 2).reshape(B, T, self.n_heads * self.d_head)
 
         # Sparse gate
         if self.attn_gate is not None:
             out = self.attn_gate(out)
 
-        new_kv = (k, v) if use_cache else None
         return self.o_proj(out), new_kv
 
 
@@ -675,6 +687,11 @@ class NullAI(nn.Module):
         if T not in self._causal_mask_cache:
             mask = torch.full((1, 1, T, T), float('-inf'), device=device)
             mask = torch.triu(mask, diagonal=1)
+            # Sliding window attention
+            if hasattr(self.cfg, 'window_size') and self.cfg.window_size > 0:
+                # Mask tokens further back than window_size
+                mask_low = torch.tril(torch.ones(T, T, device=device), diagonal=-self.cfg.window_size-1)
+                mask.masked_fill_(mask_low.bool().unsqueeze(0).unsqueeze(0), float('-inf'))
             self._causal_mask_cache[T] = mask
         return self._causal_mask_cache[T]
 
@@ -687,8 +704,13 @@ class NullAI(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[List[Tuple[torch.Tensor, torch.Tensor]]]]:
         B, T   = input_ids.shape
         device = input_ids.device
+        next_kv = [] if use_cache else None
 
-        causal_mask = self._get_causal_mask(T, device) if past_kv is None else None
+        # In case of KV cache, we might need a longer mask if not cached
+        max_T = T
+        if past_kv is not None:
+            max_T = T + past_kv[0][0].shape[2]
+        causal_mask = self._get_causal_mask(max_T, device)
 
         # ── Embedding + Encoding ─────────────────────────────────────────
         x = self.embed(input_ids)                    # (B, T, D)
@@ -982,56 +1004,47 @@ def get_lr(step: int, cfg: NullAIConfig, total_steps: int) -> float:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 class ChatTokenizer:
-    """Word/subword-like tokenizer with explicit chat role tokens."""
+    """Byte-Level BPE Tokenizer using HuggingFace tokenizers library."""
     PAD, BOS, EOS, UNK, USER, ASSISTANT = 0, 1, 2, 3, 4, 5
 
-    def __init__(self, vocab: Optional[Dict[str, int]] = None, vocab_size: int = 32000):
+    def __init__(self, tokenizer_obj: Optional[Tokenizer] = None, vocab_size: int = 32000):
         self.special_tokens = ["<|pad|>", "<|bos|>", "<|eos|>", "<|unk|>", "<|user|>", "<|assistant|>"]
         self.vocab_size_target = vocab_size
-        if vocab is None:
-            vocab = {tok: i for i, tok in enumerate(self.special_tokens)}
-        self.stoi = vocab
-        self.itos = {i: s for s, i in self.stoi.items()}
-        self.vocab_size = len(self.stoi)
+        if tokenizer_obj is not None:
+            self.tokenizer = tokenizer_obj
+        else:
+            self.tokenizer = Tokenizer(models.BPE(unk_token="<|unk|>"))
+            self.tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+            self.tokenizer.decoder = decoders.ByteLevel()
+            self.tokenizer.post_processor = processors.ByteLevel(trim_offsets=False)
 
     def train(self, texts: List[str]):
-        counter = Counter()
-        for t in texts:
-            counter.update(re.findall(r"\w+|[^\w\s]|\n", t.lower()))
-        vocab = {tok: i for i, tok in enumerate(self.special_tokens)}
-        for tok, _ in counter.most_common(max(0, self.vocab_size_target - len(vocab))):
-            if tok not in vocab:
-                vocab[tok] = len(vocab)
-        self.stoi = vocab
-        self.itos = {i: s for s, i in self.stoi.items()}
-        self.vocab_size = len(self.stoi)
+        trainer = trainers.BpeTrainer(
+            vocab_size=self.vocab_size_target,
+            special_tokens=self.special_tokens,
+            initial_alphabet=pre_tokenizers.ByteLevel.alphabet()
+        )
+        self.tokenizer.train_from_iterator(texts, trainer=trainer)
 
     def save(self, path: str):
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(self.stoi, f, ensure_ascii=False)
+        self.tokenizer.save(path)
 
     @classmethod
     def load(cls, path: str):
-        with open(path, "r", encoding="utf-8") as f:
-            vocab = json.load(f)
-        return cls(vocab=vocab, vocab_size=len(vocab))
+        return cls(tokenizer_obj=Tokenizer.from_file(path))
 
-    def encode(self, text: str, add_bos: bool = True) -> List[int]:
-        toks = re.findall(r"<\|user\|>|<\|assistant\|>|\w+|[^\w\s]|\n", text.lower())
-        ids = [self.stoi.get(t, self.UNK) for t in toks]
+    def encode(self, text: str, add_bos: bool = False) -> List[int]:
+        ids = self.tokenizer.encode(text).ids
         if add_bos:
             ids = [self.BOS] + ids
         return ids
 
     def decode(self, ids: List[int], skip_special: bool = True) -> str:
-        out = []
-        for i in ids:
-            tok = self.itos.get(i, "<|unk|>")
-            if skip_special and tok in self.special_tokens:
-                continue
-            out.append(tok)
-        txt = " ".join(out).replace(" \n ", "\n").replace(" \n", "\n")
-        return txt
+        return self.tokenizer.decode(ids, skip_special_tokens=skip_special)
+
+    @property
+    def vocab_size(self):
+        return self.tokenizer.get_vocab_size()
 
 # Backward compatibility alias
 CharTokenizer = ChatTokenizer
@@ -1212,47 +1225,82 @@ DATASETS = {
 
 def load_data(cfg: NullAIConfig, data_path: Optional[str] = None,
               device: torch.device = torch.device('cpu'),
-              dataset: str = 'dolly'):
+              dataset_name: str = 'dolly'):
     """
-    Load training text.  Priority:
+    Load training text. Priority:
       1. --data path if given
-      2. Local {dataset}.txt if exists
-      3. Download the dataset from the internet
+      2. HuggingFace datasets mix (Dolly + slice of UltraChat)
     Returns (train_ds, val_ds, tokenizer)
     """
+    lines = []
     if data_path and os.path.exists(data_path):
         print(f"  Loading data from: {data_path}")
         text = open(data_path, encoding='utf-8', errors='replace').read()
-    else:
-        local = DATASETS[dataset][1]
-        if os.path.exists(local):
-            print(f"  Loading cached dataset: {local}")
-            text = open(local, encoding='utf-8', errors='replace').read()
+        if text.lstrip().startswith("{"):
+            for ln in text.splitlines():
+                if not ln.strip(): continue
+                ex = json.loads(ln)
+                inst = ex.get("instruction", "")
+                ctx = ex.get("context", "")
+                resp = ex.get("response", "")
+                lines.append(f"<|user|> {inst}\n{ctx}\n<|assistant|> {resp}\n")
         else:
-            url = DATASETS[dataset][0]
-            print(f"  Downloading {dataset} from:\n    {url}")
-            urllib.request.urlretrieve(url, local)
-            text = open(local, encoding='utf-8', errors='replace').read()
-            print(f"  Downloaded {len(text):,} chars → {local}")
-
-    lines = []
-    if text.lstrip().startswith("{"):
-        for ln in text.splitlines():
-            if not ln.strip():
-                continue
-            ex = json.loads(ln)
-            inst = ex.get("instruction", "")
-            ctx = ex.get("context", "")
-            resp = ex.get("response", "")
-            lines.append(f"<|user|> {inst}\n{ctx}\n<|assistant|> {resp}\n")
+            lines = [f"<|user|> summarize this\n<|assistant|> {chunk}\n"
+                     for chunk in text.split("\n\n") if chunk.strip()]
     else:
-        lines = [f"<|user|> summarize this\n<|assistant|> {chunk}\n"
-                 for chunk in text.split("\n\n") if chunk.strip()]
+        print(f"  Loading robust dataset mix from HuggingFace Hub...")
+        # Dolly 15k
+        try:
+            dolly = load_dataset("databricks/databricks-dolly-15k", split="train")
+            for ex in tqdm(dolly, desc="Processing Dolly"):
+                inst = ex.get("instruction", "")
+                ctx = ex.get("context", "")
+                resp = ex.get("response", "")
+                lines.append(f"<|user|> {inst}\n{ctx}\n<|assistant|> {resp}\n")
+        except Exception as e:
+            print(f"  Could not load Dolly from HF: {e}. Trying local fallback.")
+            local = DATASETS.get(dataset_name, DATASETS['dolly'])[1]
+            if os.path.exists(local):
+                text = open(local, encoding='utf-8', errors='replace').read()
+                for ln in text.splitlines():
+                    if not ln.strip(): continue
+                    try:
+                        ex = json.loads(ln)
+                        lines.append(f"<|user|> {ex.get('instruction','')}\n{ex.get('context','')}\n<|assistant|> {ex.get('response','')}\n")
+                    except: continue
+
+        # UltraChat slice (10k examples)
+        try:
+            print("  Loading a slice of UltraChat for robustness...")
+            ultrachat = load_dataset("HuggingFaceH4/ultrachat_200k", split="train_sft", streaming=True)
+            count = 0
+            for ex in tqdm(ultrachat, total=10000, desc="Processing UltraChat"):
+                if count >= 10000: break
+                msgs = ex.get("messages", [])
+                formatted = ""
+                for m in msgs:
+                    role = m.get("role", "")
+                    content = m.get("content", "")
+                    if role == "user":
+                        formatted += f"<|user|> {content}\n"
+                    elif role == "assistant":
+                        formatted += f"<|assistant|> {content}\n"
+                if formatted:
+                    lines.append(formatted)
+                    count += 1
+        except Exception as e:
+            print(f"  Could not load UltraChat: {e}. Continuing with available data.")
 
     tokenizer = ChatTokenizer(vocab_size=cfg.vocab_size)
+    print(f"  Training BPE Tokenizer on {len(lines):,} examples...")
     tokenizer.train(lines)
     tokenizer.save(cfg.tokenizer_path)
     cfg.vocab_size = tokenizer.vocab_size
+
+    # Shuffle for better distribution
+    random.seed(cfg.seed)
+    random.shuffle(lines)
+
     merged_text = "".join(lines)
     print(f"  Corpus: {len(merged_text):,} chars  |  vocab_size: {tokenizer.vocab_size}")
 
@@ -1472,11 +1520,13 @@ def train(cfg: NullAIConfig, data_path: Optional[str] = None,
   │  d_head         : {d_head:<4}  (rope_frac={cfg.rope_frac:.2f})       │
   │  d_mlp          : {cfg.d_mlp:<4}  (LeakyReLU²)           │
   │  vocab_size     : {cfg.vocab_size:<4}                         │
+  │  max_seq_len    : {cfg.max_seq_len:<4}                         │
   │  SNN Encoder    : {'ON ' if cfg.snn_encoder else 'off'}   (Hypercube {cfg.snn_hypercube_dim}D)          │
   │  SmearGate      : {'ON ' if cfg.smear_gate else 'off'}   (BOS-fixed)            │
   │  Sparse Gate    : {'ON ' if cfg.sparse_attn_gate else 'off'}   (window={cfg.gate_window})               │
   │  U-Net skips    : {'ON ' if cfg.unet_skips else 'off'}                         │
   │  Parallel dec   : {'ON ' if cfg.parallel_decoder else 'off'}   (start layer {cfg.parallel_decoder_start})       │
+  │  SWA Window     : {cfg.window_size:<4}                         │
   │  Logit softcap  : {cfg.logit_softcap}                        │
   ├─────────────────────────────────────────────┤
   │  Parameters     : {n_par:>10,}               │
@@ -1616,12 +1666,13 @@ def parse_args():
 
     # Model
     g = p.add_argument_group('Model')
-    g.add_argument('--d_model',     type=int,   default=256)
+    g.add_argument('--d_model',     type=int,   default=264)
     g.add_argument('--n_layers',    type=int,   default=8)
     g.add_argument('--n_heads',     type=int,   default=4)
     g.add_argument('--n_kv_heads',  type=int,   default=2)
-    g.add_argument('--d_mlp',       type=int,   default=1024)
-    g.add_argument('--max_seq_len', type=int,   default=512)
+    g.add_argument('--d_mlp',       type=int,   default=1056)
+    g.add_argument('--max_seq_len', type=int,   default=2048)
+    g.add_argument('--window_size', type=int,   default=512)
 
     # Features
     g2 = p.add_argument_group('Architecture Features')
@@ -1670,6 +1721,7 @@ if __name__ == '__main__':
         n_kv_heads        = args.n_kv_heads,
         d_mlp             = args.d_mlp,
         max_seq_len       = args.max_seq_len,
+        window_size       = args.window_size,
         snn_encoder       = not args.no_snn,
         smear_gate        = not args.no_smear,
         sparse_attn_gate  = not args.no_sparse,
