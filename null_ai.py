@@ -54,6 +54,8 @@ Usage:
 
 import os, sys, math, time, json, copy, struct, argparse, hashlib
 import urllib.request
+import re
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, List, Dict
 
@@ -75,7 +77,7 @@ class NullAIConfig:
     """
 
     # ── Model size ──────────────────────────────────────────────────────────
-    vocab_size: int  = 256       # Updated at runtime by tokenizer
+    vocab_size: int  = 32000     # Updated at runtime by tokenizer
     max_seq_len: int = 512
     d_model: int     = 256       # Hidden dimension
     n_layers: int    = 8         # Number of transformer blocks
@@ -164,6 +166,7 @@ class NullAIConfig:
 
     # Runtime (set automatically, not user-facing)
     _actual_vocab: int = 0
+    tokenizer_path: str = "tokenizer_vocab.json"
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -475,8 +478,9 @@ class GQAttention(nn.Module):
         else:
             self.attn_gate = None
 
-    def forward(self, x: torch.Tensor,
-                causal_mask: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, causal_mask: Optional[torch.Tensor],
+                past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+                use_cache: bool = False):
         B, T, D = x.shape
 
         q = self.q_proj(x).reshape(B, T, self.n_heads, self.d_head).transpose(1, 2)
@@ -493,10 +497,15 @@ class GQAttention(nn.Module):
         # Expand KV for GQA
         k = k.repeat_interleave(self.n_rep, dim=1)   # (B, H, T, d_head)
         v = v.repeat_interleave(self.n_rep, dim=1)
+        if past_kv is not None:
+            pk, pv = past_kv
+            k = torch.cat([pk, k], dim=2)
+            v = torch.cat([pv, v], dim=2)
 
         # Attention scores + causal mask
-        scores = torch.matmul(q * scale, k.transpose(-2, -1))  # (B, H, T, T)
-        scores = scores + causal_mask                           # broadcast over B, H
+        scores = torch.matmul(q * scale, k.transpose(-2, -1))
+        if causal_mask is not None:
+            scores = scores + causal_mask
         attn   = F.softmax(scores, dim=-1)
 
         out = torch.matmul(attn, v)                   # (B, H, T, d_head)
@@ -506,7 +515,8 @@ class GQAttention(nn.Module):
         if self.attn_gate is not None:
             out = self.attn_gate(out)
 
-        return self.o_proj(out)
+        new_kv = (k, v) if use_cache else None
+        return self.o_proj(out), new_kv
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -565,19 +575,22 @@ class NullAIBlock(nn.Module):
         self.skip_gate = nn.Parameter(torch.zeros(cfg.d_model))
 
     def forward(self, x: torch.Tensor,
-                causal_mask: torch.Tensor,
-                skip: Optional[torch.Tensor] = None) -> torch.Tensor:
+                causal_mask: Optional[torch.Tensor],
+                skip: Optional[torch.Tensor] = None,
+                past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+                use_cache: bool = False):
         # Inject U-Net encoder skip (decoder layers only)
         if skip is not None:
             x = x + torch.sigmoid(self.skip_gate) * skip
 
         # Attention sub-layer
-        x = x + self.attn(self.norm1(x) * self.ln_scale, causal_mask)
+        attn_out, new_kv = self.attn(self.norm1(x) * self.ln_scale, causal_mask, past_kv=past_kv, use_cache=use_cache)
+        x = x + attn_out
 
         # MLP sub-layer
         x = x + self.mlp(self.norm2(x) * self.ln_scale)
 
-        return x
+        return x, new_kv
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -669,11 +682,13 @@ class NullAI(nn.Module):
         self,
         input_ids: torch.Tensor,
         targets: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        past_kv: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[List[Tuple[torch.Tensor, torch.Tensor]]]]:
         B, T   = input_ids.shape
         device = input_ids.device
 
-        causal_mask = self._get_causal_mask(T, device)
+        causal_mask = self._get_causal_mask(T, device) if past_kv is None else None
 
         # ── Embedding + Encoding ─────────────────────────────────────────
         x = self.embed(input_ids)                    # (B, T, D)
@@ -709,7 +724,10 @@ class NullAI(nn.Module):
             # Depth recurrence: run middle layers multiple times
             reps = n_repeats if i in loop_set else 1
             for _ in range(reps):
-                x = block(x, causal_mask, skip=skip)
+                kv_i = past_kv[i] if (past_kv is not None and i < len(past_kv)) else None
+                x, new_kv = block(x, causal_mask, skip=skip, past_kv=kv_i, use_cache=use_cache)
+                if use_cache:
+                    next_kv.append(new_kv)
                 skip = None   # Only inject skip on first repeat
 
             # Save encoder state for U-Net
@@ -727,7 +745,7 @@ class NullAI(nn.Module):
                     and i >= pd_start):
                 lane_block_idx = i - pd_start
                 if lane_block_idx < len(self.parallel_blocks):
-                    x_lane2 = self.parallel_blocks[lane_block_idx](
+                    x_lane2, _ = self.parallel_blocks[lane_block_idx](
                         x_lane2, causal_mask)
 
         # Merge parallel lane
@@ -753,7 +771,7 @@ class NullAI(nn.Module):
                 ignore_index=self.cfg.pad_id,
             )
 
-        return logits, loss
+        return logits, loss, next_kv
 
     @torch.no_grad()
     def generate(
@@ -769,7 +787,10 @@ class NullAI(nn.Module):
 
         for _ in range(max_new_tokens):
             ctx    = prompt_ids[:, -self.cfg.max_seq_len:]
-            logits, _ = self.forward(ctx)
+            if _ == 0:
+                logits, _, kv_cache = self.forward(ctx, use_cache=True)
+            else:
+                logits, _, kv_cache = self.forward(prompt_ids[:, -1:], past_kv=kv_cache, use_cache=True)
             logits = logits[:, -1, :] / max(temperature, 1e-6)
 
             # Top-k filtering
@@ -936,33 +957,60 @@ def get_lr(step: int, cfg: NullAIConfig, total_steps: int) -> float:
 # SECTION 14 — TOKENIZER
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-class CharTokenizer:
-    """
-    Byte-level character tokenizer.
-    Encodes text as raw bytes (0-255) with 4 reserved special tokens.
-    Vocab size: 260 (256 bytes + PAD, BOS, EOS, UNK).
+class ChatTokenizer:
+    """Word/subword-like tokenizer with explicit chat role tokens."""
+    PAD, BOS, EOS, UNK, USER, ASSISTANT = 0, 1, 2, 3, 4, 5
 
-    Compatible with any language / script (no OOV for valid bytes).
-    """
-    PAD, BOS, EOS, UNK = 0, 1, 2, 3
+    def __init__(self, vocab: Optional[Dict[str, int]] = None, vocab_size: int = 32000):
+        self.special_tokens = ["<|pad|>", "<|bos|>", "<|eos|>", "<|unk|>", "<|user|>", "<|assistant|>"]
+        self.vocab_size_target = vocab_size
+        if vocab is None:
+            vocab = {tok: i for i, tok in enumerate(self.special_tokens)}
+        self.stoi = vocab
+        self.itos = {i: s for s, i in self.stoi.items()}
+        self.vocab_size = len(self.stoi)
 
-    def __init__(self):
-        self.vocab_size = 260   # 256 bytes + 4 specials
-        self._offset    = 4     # byte b → token (b + offset)
+    def train(self, texts: List[str]):
+        counter = Counter()
+        for t in texts:
+            counter.update(re.findall(r"\w+|[^\w\s]|\n", t.lower()))
+        vocab = {tok: i for i, tok in enumerate(self.special_tokens)}
+        for tok, _ in counter.most_common(max(0, self.vocab_size_target - len(vocab))):
+            if tok not in vocab:
+                vocab[tok] = len(vocab)
+        self.stoi = vocab
+        self.itos = {i: s for s, i in self.stoi.items()}
+        self.vocab_size = len(self.stoi)
+
+    def save(self, path: str):
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(self.stoi, f, ensure_ascii=False)
+
+    @classmethod
+    def load(cls, path: str):
+        with open(path, "r", encoding="utf-8") as f:
+            vocab = json.load(f)
+        return cls(vocab=vocab, vocab_size=len(vocab))
 
     def encode(self, text: str, add_bos: bool = True) -> List[int]:
-        ids = [b + self._offset for b in text.encode('utf-8', errors='replace')]
+        toks = re.findall(r"<\|user\|>|<\|assistant\|>|\w+|[^\w\s]|\n", text.lower())
+        ids = [self.stoi.get(t, self.UNK) for t in toks]
         if add_bos:
             ids = [self.BOS] + ids
         return ids
 
     def decode(self, ids: List[int], skip_special: bool = True) -> str:
-        specials = {self.PAD, self.BOS, self.EOS, self.UNK}
-        raw      = bytes(
-            i - self._offset for i in ids
-            if (i >= self._offset) and (not skip_special or i not in specials)
-        )
-        return raw.decode('utf-8', errors='replace')
+        out = []
+        for i in ids:
+            tok = self.itos.get(i, "<|unk|>")
+            if skip_special and tok in self.special_tokens:
+                continue
+            out.append(tok)
+        txt = " ".join(out).replace(" \n ", "\n").replace(" \n", "\n")
+        return txt
+
+# Backward compatibility alias
+CharTokenizer = ChatTokenizer
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1058,7 +1106,7 @@ def test_time_train(
     model.train()
     for _ in range(cfg.ttt_steps):
         with autocast(dtype=torch.bfloat16):
-            _, loss = model(x, y)
+            _, loss, _ = model(x, y)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
@@ -1066,7 +1114,7 @@ def test_time_train(
 
     model.eval()
     with torch.no_grad(), autocast(dtype=torch.bfloat16):
-        _, val_loss = model(x, y)
+        _, val_loss, _ = model(x, y)
     ttt_loss = val_loss.item()
 
     # Restore original weights
@@ -1132,19 +1180,15 @@ def load_quantised(path: str, device: torch.device) -> Tuple['NullAI', NullAICon
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 DATASETS = {
-    'shakespeare': (
-        'https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt',
-        'shakespeare.txt'
-    ),
-    'wiki103': (
-        'https://raw.githubusercontent.com/karpathy/llm.c/master/data/tiny_shakespeare.txt',
-        'wiki103_small.txt'
+    'dolly': (
+        'https://raw.githubusercontent.com/databrickslabs/dolly/master/data/databricks-dolly-15k.jsonl',
+        'databricks-dolly-15k.jsonl'
     ),
 }
 
 def load_data(cfg: NullAIConfig, data_path: Optional[str] = None,
               device: torch.device = torch.device('cpu'),
-              dataset: str = 'shakespeare'):
+              dataset: str = 'dolly'):
     """
     Load training text.  Priority:
       1. --data path if given
@@ -1152,9 +1196,6 @@ def load_data(cfg: NullAIConfig, data_path: Optional[str] = None,
       3. Download the dataset from the internet
     Returns (train_ds, val_ds, tokenizer)
     """
-    tokenizer = CharTokenizer()
-    cfg.vocab_size = tokenizer.vocab_size
-
     if data_path and os.path.exists(data_path):
         print(f"  Loading data from: {data_path}")
         text = open(data_path, encoding='utf-8', errors='replace').read()
@@ -1170,9 +1211,28 @@ def load_data(cfg: NullAIConfig, data_path: Optional[str] = None,
             text = open(local, encoding='utf-8', errors='replace').read()
             print(f"  Downloaded {len(text):,} chars → {local}")
 
-    print(f"  Corpus: {len(text):,} chars  |  vocab_size: {tokenizer.vocab_size}")
+    lines = []
+    if text.lstrip().startswith("{"):
+        for ln in text.splitlines():
+            if not ln.strip():
+                continue
+            ex = json.loads(ln)
+            inst = ex.get("instruction", "")
+            ctx = ex.get("context", "")
+            resp = ex.get("response", "")
+            lines.append(f"<|user|> {inst}\n{ctx}\n<|assistant|> {resp}\n")
+    else:
+        lines = [f"<|user|> summarize this\n<|assistant|> {chunk}\n"
+                 for chunk in text.split("\n\n") if chunk.strip()]
 
-    ids  = tokenizer.encode(text, add_bos=False)
+    tokenizer = ChatTokenizer(vocab_size=cfg.vocab_size)
+    tokenizer.train(lines)
+    tokenizer.save(cfg.tokenizer_path)
+    cfg.vocab_size = tokenizer.vocab_size
+    merged_text = "".join(lines)
+    print(f"  Corpus: {len(merged_text):,} chars  |  vocab_size: {tokenizer.vocab_size}")
+
+    ids  = tokenizer.encode(merged_text, add_bos=False)
     data = torch.tensor(ids, dtype=torch.long)
 
     n_train   = int(0.9 * len(data))
@@ -1269,7 +1329,7 @@ class NullAITrainer:
         self.adam.zero_grad()
 
         with autocast(dtype=torch.bfloat16):
-            _, loss = self.model(x, y)
+            _, loss, _ = self.model(x, y)
 
         self.scaler.scale(loss).backward()
         self.scaler.unscale_(self.muon)
@@ -1297,7 +1357,7 @@ class NullAITrainer:
         for _ in range(n_batches):
             x, y = val_ds.get_batch(self.cfg.batch_size)
             with autocast(dtype=torch.bfloat16):
-                _, loss = self.model(x, y)
+                _, loss, _ = self.model(x, y)
             total += loss.item()
         val_bpb = bits_per_byte(total / n_batches)
 
@@ -1563,8 +1623,8 @@ def parse_args():
     # Data
     g4 = p.add_argument_group('Data')
     g4.add_argument('--data',    type=str, default=None,
-                    help='Path to training text file (default: downloads Shakespeare)')
-    g4.add_argument('--dataset', type=str, default='shakespeare',
+                    help='Path to training text / jsonl file')
+    g4.add_argument('--dataset', type=str, default='dolly',
                     choices=list(DATASETS.keys()))
 
     # Misc
@@ -1600,7 +1660,7 @@ if __name__ == '__main__':
         warmup_steps      = args.warmup,
         grad_clip         = args.grad_clip,
         seed              = args.seed,
-        vocab_size        = 260,              # Updated at load time by tokenizer
+        vocab_size        = 32000,            # Updated at load time by tokenizer
     )
 
     if args.eval_only:
@@ -1619,7 +1679,7 @@ if __name__ == '__main__':
         for _ in range(n):
             x, y = val_ds.get_batch(8)
             with torch.no_grad(), autocast(dtype=torch.bfloat16):
-                _, loss = model(x, y)
+                _, loss, _ = model(x, y)
             total += loss.item()
         print(f"Val BPB: {bits_per_byte(total/n):.4f}")
     else:
