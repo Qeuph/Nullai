@@ -1,48 +1,50 @@
 # Null AI
 
-Null AI is a compact character-level language model trainer and inference stack implemented in a single file (`null_ai.py`). It targets T4-class GPUs and produces small checkpoints that are easy to run locally.
+Null AI is a compact single-file language model trainer + inference stack centered on `null_ai.py`.
 
-## Training run summary
+## Current training/data pipeline
 
-The latest recorded run (provided in project notes) used:
+- **Default dataset:** Databricks Dolly 15k (`databricks-dolly-15k.jsonl`).
+- **Auto-download behavior:** If `--data` is not provided and local Dolly file is missing, the dataset is downloaded automatically.
+- **Input format handling:**
+  - JSONL with `instruction/context/response` fields is transformed into chat turns:
+    `<|user|> ... <|assistant|> ...`
+  - Plain text files are split on blank lines and wrapped into synthetic user/assistant pairs.
+- **Train/val split:** 90/10 token split after tokenization.
 
-- **Device:** CUDA
-- **GPU:** Tesla T4
-- **VRAM:** 15.6 GB
-- **dtype:** bfloat16 mixed precision
+## Current tokenizer
 
-### Model snapshot
+Null AI currently uses `ChatTokenizer` (word/subword-like regex tokenizer), not byte-level BPE.
+
+- **Special tokens:**
+  - `<|pad|>` = 0
+  - `<|bos|>` = 1
+  - `<|eos|>` = 2
+  - `<|unk|>` = 3
+  - `<|user|>` = 4
+  - `<|assistant|>` = 5
+- **Vocabulary build:** top-frequency regex tokens from the loaded corpus, capped by `cfg.vocab_size` target (default 32k).
+- **Saved vocab file:** `tokenizer_vocab.json`.
+- **Runtime vocab:** `cfg.vocab_size` is overwritten with the trained tokenizer's actual vocabulary size.
+
+## Model snapshot (project defaults)
 
 - **Architecture:** 8 layers, `d_model=256`, GQA (`4Q / 2KV`), `d_mlp=1024`
-- **Parameters:** 7,481,267
-- **Model size (bf16):** 14.3 MB
-- **Quantized checkpoint:** 7.3 MB (`null_ai_final_int8.pt`)
-- **Best validation BPB:** 2.0384 (at step 4000)
-- **Total steps:** 10,000
-- **Total training time:** 53:55
+- **Context length:** `max_seq_len=512` (train sequence chunks default `seq_len=256`)
+- **Core features:**
+  - Partial RoPE
+  - SmearGate
+  - Sparse attention head-output gate
+  - U-Net skip connections
+  - Optional depth recurrence
+  - Optional parallel decoder lane
+  - SNN-inspired hypercube spike encoder
+  - EMA + post-training int8 quantization
 
-## Features
-
-- Grouped Query Attention (GQA)
-- Partial RoPE + stabilized layernorm scaling
-- SNN-inspired hypercube spike encoder
-- Sparse attention gating
-- U-Net skip connections
-- Optional depth recurrence
-- Parallel decoder lane
-- TTT (test-time training) evaluation path
-- EMA weights + int8 post-training quantization
-
-## Requirements
-
-- Python 3.10+
-- PyTorch (CUDA build recommended for training)
-- NumPy
-
-Install basics:
+## Install
 
 ```bash
-pip install torch numpy
+pip install -r requirements.txt
 ```
 
 ## Train
@@ -51,40 +53,52 @@ pip install torch numpy
 python null_ai.py
 ```
 
-Useful options:
+Useful examples:
 
 ```bash
+python null_ai.py --dataset dolly
 python null_ai.py --data my_corpus.txt --max_iters 20000
 python null_ai.py --d_model 384 --n_layers 10 --max_iters 15000
 ```
 
-## Inference chatbot loop
+## Inference (interactive chat)
 
-Use the interactive chatbot script:
+FP checkpoint:
 
 ```bash
 python chat_loop.py --checkpoint null_ai_final.pt
 ```
 
-or with the quantized checkpoint:
+Quantized checkpoint:
 
 ```bash
 python chat_loop.py --checkpoint null_ai_final_int8.pt --quantized
 ```
 
-### Commands inside chat
+### Improved decoding controls
 
-- `/reset` — clear conversation memory
-- `/raw` — print raw generated text (including prompt prefix)
+`chat_loop.py` now supports stronger anti-loop/repetition controls:
+
+- `--repetition_penalty` (default `1.1`)
+- `--no_repeat_ngram_size` (default `3`)
+- `--min_new_tokens` (default `24`)
+- Existing: `--temperature`, `--top_k`, `--top_p`, `--max_new_tokens`
+
+The chat loop also trims long history to fit model context (`cfg.max_seq_len`) before generation.
+
+### In-chat commands
+
+- `/reset` — clear conversation history
+- `/raw` — generate from a one-off prompt and print raw text
 - `/quit` — exit
 
-## PyTorch 2.6+ compatibility note
+## PyTorch compatibility note
 
-PyTorch 2.6 changed `torch.load` default behavior to `weights_only=True`, which can break loading checkpoints that contain pickled config/classes. `chat_loop.py` now loads full checkpoints in compatibility mode (`weights_only=False`, with fallback for older PyTorch) and registers legacy `__main__` symbols so older Null AI checkpoints still load.
+PyTorch 2.6+ changed `torch.load` default behavior (`weights_only=True`).
+`chat_loop.py` includes compatibility loading for legacy checkpoints that store pickled config/classes.
 
-If you trust your checkpoint source and still see loading errors, ensure you are launching with the updated `chat_loop.py` from this repository.
+## Files
 
-## Notes
-
-- This is a **character-level** model, so outputs can drift into noisy Shakespeare-like text depending on temperature.
-- If you trained on a different corpus, generation style will follow that corpus.
+- `null_ai.py` — model, tokenizer, data pipeline, training, quantization
+- `chat_loop.py` — interactive inference client
+- `requirements.txt` — Python dependencies

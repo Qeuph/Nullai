@@ -1,0 +1,3 @@
+numpy>=1.24
+# Install a CUDA-enabled torch wheel for GPU training when available
+torch>=2.2
