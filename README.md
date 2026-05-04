@@ -11,6 +11,8 @@ Null AI is a compact single-file language model trainer + inference stack center
     `<|user|> ... <|assistant|> ...`
   - Plain text files are split on blank lines and wrapped into synthetic user/assistant pairs.
 - **Train/val split:** 90/10 token split after tokenization.
+- **Assistant-only supervision:** training masks loss outside `<|assistant|>` spans by default (`train_assistant_only=True`).
+- **Progressive context curriculum:** default schedule grows train sequence length from 256 → 512 → 1024 → 2048 through training.
 
 ## Current tokenizer
 
@@ -78,11 +80,14 @@ python chat_loop.py --checkpoint null_ai_final_int8.pt --quantized
 ### Decoding controls
 
 - `--repetition_penalty` (default `1.1`)
+- `--presence_penalty` (default `0.05`)
+- `--frequency_penalty` (default `0.05`)
+- `--repeat_window` (default `192`)
 - `--no_repeat_ngram_size` (default `3`)
 - `--min_new_tokens` (default `24`)
 - Existing: `--temperature`, `--top_k`, `--top_p`, `--max_new_tokens`
 
-The chat loop trims long history to fit model context (`cfg.max_seq_len`) before generation.
+The chat loop uses turn-structured history and trims full oldest turns to fit model context (`cfg.max_seq_len`) before generation.
 
 ### In-chat commands
 

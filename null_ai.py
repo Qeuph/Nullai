@@ -130,6 +130,8 @@ class NullAIConfig:
     # ── Training ────────────────────────────────────────────────────────────
     batch_size: int           = 24     # Fits T4 16GB easily with seq_len=256
     seq_len: int              = 256
+    train_assistant_only: bool = True
+    seq_len_schedule: tuple   = ((0.0, 256), (0.4, 512), (0.7, 1024), (0.9, 2048))
     lr_peak: float            = 3e-3
     lr_min_frac: float        = 0.10   # MIN_LR = lr_peak * lr_min_frac
     warmup_steps: int         = 100
@@ -1057,10 +1059,14 @@ CharTokenizer = ChatTokenizer
 class TextDataset:
     """Simple random-chunk dataset for language modelling."""
 
-    def __init__(self, data: torch.Tensor, seq_len: int, device: torch.device):
+    def __init__(self, data: torch.Tensor, seq_len: int, device: torch.device,
+                 assistant_mask: Optional[torch.Tensor] = None,
+                 train_assistant_only: bool = True):
         self.data    = data
         self.seq_len = seq_len
         self.device  = device
+        self.assistant_mask = assistant_mask
+        self.train_assistant_only = train_assistant_only
 
     def __len__(self):
         return len(self.data) - self.seq_len - 1
@@ -1070,7 +1076,13 @@ class TextDataset:
         idx = torch.randint(0, n, (batch_size,))
         x   = torch.stack([self.data[i   : i + self.seq_len    ] for i in idx])
         y   = torch.stack([self.data[i+1 : i + self.seq_len + 1] for i in idx])
+        if self.train_assistant_only and self.assistant_mask is not None:
+            mask = torch.stack([self.assistant_mask[i+1 : i + self.seq_len + 1] for i in idx]).bool()
+            y = y.masked_fill(~mask, -100)
         return x.to(self.device), y.to(self.device)
+
+    def set_seq_len(self, seq_len: int):
+        self.seq_len = seq_len
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1305,13 +1317,33 @@ def load_data(cfg: NullAIConfig, data_path: Optional[str] = None,
     print(f"  Corpus: {len(merged_text):,} chars  |  vocab_size: {tokenizer.vocab_size}")
 
     ids  = tokenizer.encode(merged_text, add_bos=False)
+    assistant_ids_mask = [0] * len(ids)
+    if cfg.train_assistant_only:
+        assistant_tok = tokenizer.ASSISTANT
+        user_tok = tokenizer.USER
+        eos_tok = tokenizer.EOS
+        in_assistant = False
+        for i, tok in enumerate(ids):
+            if tok == assistant_tok:
+                in_assistant = True
+                assistant_ids_mask[i] = 0
+                continue
+            if tok == user_tok or tok == eos_tok:
+                in_assistant = False
+                assistant_ids_mask[i] = 0
+                continue
+            assistant_ids_mask[i] = 1 if in_assistant else 0
     data = torch.tensor(ids, dtype=torch.long)
+    assistant_mask = torch.tensor(assistant_ids_mask, dtype=torch.bool) if cfg.train_assistant_only else None
 
     n_train   = int(0.9 * len(data))
-    train_ds  = TextDataset(data[:n_train],  cfg.seq_len, device)
-    val_ds    = TextDataset(data[n_train:],   cfg.seq_len, device)
+    train_ds  = TextDataset(data[:n_train],  cfg.seq_len, device, assistant_mask[:n_train] if assistant_mask is not None else None, cfg.train_assistant_only)
+    val_ds    = TextDataset(data[n_train:],   cfg.seq_len, device, assistant_mask[n_train:] if assistant_mask is not None else None, cfg.train_assistant_only)
 
     print(f"  Train: {n_train:,} tokens  |  Val: {len(data)-n_train:,} tokens")
+    if cfg.train_assistant_only:
+        ratio = float(assistant_mask.float().mean().item()) if assistant_mask is not None else 0.0
+        print(f"  Assistant-supervised token ratio: {ratio:.2%}")
     return train_ds, val_ds, tokenizer
 
 
@@ -1565,8 +1597,25 @@ def train(cfg: NullAIConfig, data_path: Optional[str] = None,
     run_loss     = 0.0
     log_count    = 0
     best_path    = 'null_ai_best.pt'
+    seq_schedule = sorted([(float(p), int(s)) for p, s in cfg.seq_len_schedule], key=lambda x: x[0])
+    current_seq_len = cfg.seq_len
+
+    def apply_seq_len_for_step(step_idx: int):
+        nonlocal current_seq_len
+        progress = step_idx / max(1, cfg.max_iters - 1)
+        target_seq = current_seq_len
+        for frac, slen in seq_schedule:
+            if progress >= frac:
+                target_seq = min(slen, cfg.max_seq_len)
+        if target_seq != current_seq_len:
+            current_seq_len = target_seq
+            train_ds.set_seq_len(current_seq_len)
+            val_ds.set_seq_len(current_seq_len)
+            print(f"\n  [Step {step_idx}] Seq-len stage -> {current_seq_len} (progress={progress:.1%})")
+            print(f"  Tokens/step (approx): {cfg.batch_size * current_seq_len:,}")
 
     for step in range(trainer.step, cfg.max_iters):
+        apply_seq_len_for_step(step)
 
         # Wallclock guard
         elapsed = time.time() - start_time
