@@ -1174,7 +1174,7 @@ def test_time_train(
         opt.zero_grad()
 
     model.eval()
-    with torch.no_grad(), autocast(dtype=torch.bfloat16):
+    with torch.no_grad(), amp.autocast("cuda", dtype=torch.bfloat16, enabled=(x.device.type == "cuda")):
         _, val_loss, _ = model(x, y)
     ttt_loss = val_loss.item()
 
@@ -1819,7 +1819,7 @@ if __name__ == '__main__':
         _, val_ds, _ = load_data(cfg2, args.data, device, args.dataset)
         for _ in range(n):
             x, y = val_ds.get_batch(8)
-            with torch.no_grad(), autocast(dtype=torch.bfloat16):
+            with torch.no_grad(), amp.autocast("cuda", dtype=torch.bfloat16, enabled=(x.device.type == "cuda")):
                 _, loss, _ = model(x, y)
             total += loss.item()
         print(f"Val BPB: {bits_per_byte(total/n):.4f}")
