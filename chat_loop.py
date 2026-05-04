@@ -98,25 +98,90 @@ def main():
             encoded = [tokenizer.BOS] + encoded[-(cfg.max_seq_len - 1):]
         ids = torch.tensor(encoded, dtype=torch.long, device=device).unsqueeze(0)
 
-        with torch.no_grad():
-            out = model.generate(
-                ids,
-                max_new_tokens=args.max_new_tokens,
-                temperature=args.temperature,
-                top_k=args.top_k,
-                top_p=args.top_p,
-                repetition_penalty=args.repetition_penalty,
-                no_repeat_ngram_size=args.no_repeat_ngram_size,
-                min_new_tokens=args.min_new_tokens,
-            )
+        print("Assistant: ", end="", flush=True)
 
-        text = tokenizer.decode(out[0].tolist())
+        with torch.no_grad():
+            # Implementing streaming manually for now by modifying generate or using a loop
+            # To keep it simple, we'll use a modified generate-like loop here for streaming
+
+            model.eval()
+            max_new_tokens = args.max_new_tokens
+            temperature = args.temperature
+            top_k = args.top_k
+            top_p = args.top_p
+            repetition_penalty = args.repetition_penalty
+            no_repeat_ngram_size = args.no_repeat_ngram_size
+            min_new_tokens = args.min_new_tokens
+
+            prompt_ids = ids
+            kv_cache = None
+            generated_text = ""
+
+            for step in range(max_new_tokens):
+                if step == 0:
+                    logits, _, kv_cache = model(prompt_ids[:, -cfg.max_seq_len:], use_cache=True)
+                else:
+                    logits, _, kv_cache = model(prompt_ids[:, -1:], past_kv=kv_cache, use_cache=True)
+
+                logits = logits[:, -1, :] / max(temperature, 1e-6)
+
+                # Repetition penalty
+                if repetition_penalty and repetition_penalty > 1.0:
+                    seen_ids = set(prompt_ids[0].tolist())
+                    for tok_id in seen_ids:
+                        if logits[0, tok_id] < 0:
+                            logits[0, tok_id] *= repetition_penalty
+                        else:
+                            logits[0, tok_id] /= repetition_penalty
+
+                # No-repeat n-gram blocking
+                if no_repeat_ngram_size and no_repeat_ngram_size > 1 and prompt_ids.size(1) >= no_repeat_ngram_size - 1:
+                    generated = prompt_ids[0].tolist()
+                    prefix = tuple(generated[-(no_repeat_ngram_size - 1):])
+                    banned = set()
+                    for i in range(len(generated) - no_repeat_ngram_size + 1):
+                        ng = generated[i:i + no_repeat_ngram_size]
+                        if tuple(ng[:-1]) == prefix:
+                            banned.add(ng[-1])
+                    if banned:
+                        logits[0, list(banned)] = float('-inf')
+
+                # Top-k
+                if top_k > 0:
+                    k_val, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits[logits < k_val[:, [-1]]] = float('-inf')
+
+                # Top-p
+                if 0.0 < top_p < 1.0:
+                    sorted_logits, sorted_idx = torch.sort(logits, descending=True)
+                    cumprobs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+                    remove = cumprobs - torch.softmax(sorted_logits, dim=-1) > top_p
+                    sorted_logits[remove] = float('-inf')
+                    logits.scatter_(1, sorted_idx, sorted_logits)
+
+                probs = torch.softmax(logits, dim=-1)
+                next_tok = torch.multinomial(probs, num_samples=1)
+                prompt_ids = torch.cat([prompt_ids, next_tok], dim=1)
+
+                token_text = tokenizer.decode(next_tok[0].tolist(), skip_special=True)
+                print(token_text, end="", flush=True)
+                generated_text += token_text
+
+                if step + 1 >= min_new_tokens and next_tok.item() == tokenizer.EOS:
+                    break
+
+                # Check for stop sequences in generated text
+                if "\n<|user|>" in generated_text or "\n<|assistant|>" in generated_text:
+                    break
+
+            print() # End of line after generation
 
         if raw_mode:
-            print(f"\nRAW:\n{text}")
+            # For raw mode, we still printed it, but maybe the user wants something else.
+            # In this implementation, streaming and raw mode both print to console.
             continue
 
-        completion = text[len(history):]
+        completion = generated_text.strip() or "..."
         stop_positions = [
             pos for pos in (
                 completion.find("\n<|user|>"),
